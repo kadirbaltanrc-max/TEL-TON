@@ -1,0 +1,1646 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+type Section = "tuner" | "metronome" | "voice";
+type Instrument = "guitar" | "baglama";
+type BaglamaKind = "short" | "long";
+
+type Target = {
+  id: string;
+  label: string;
+  note: string;
+  frequency?: number;
+  pitchClass?: number;
+};
+
+const NOTE_NAMES = [
+  "Do",
+  "Do♯",
+  "Re",
+  "Mi♭",
+  "Mi",
+  "Fa",
+  "Fa♯",
+  "Sol",
+  "La♭",
+  "La",
+  "Si♭",
+  "Si",
+];
+
+const NOTE_LETTERS = [
+  "C",
+  "C♯",
+  "D",
+  "E♭",
+  "E",
+  "F",
+  "F♯",
+  "G",
+  "A♭",
+  "A",
+  "B♭",
+  "B",
+];
+
+const DECISION_NOTES = [5, 6, 7, 8, 9, 10, 11, 0, 1, 2];
+
+const GUITAR_TARGETS: Target[] = [
+  { id: "g6", label: "6. tel", note: "Mi · E2", frequency: 82.41 },
+  { id: "g5", label: "5. tel", note: "La · A2", frequency: 110 },
+  { id: "g4", label: "4. tel", note: "Re · D3", frequency: 146.83 },
+  { id: "g3", label: "3. tel", note: "Sol · G3", frequency: 196 },
+  { id: "g2", label: "2. tel", note: "Si · B3", frequency: 246.94 },
+  { id: "g1", label: "1. tel", note: "Mi · E4", frequency: 329.63 },
+];
+
+const assetPath = (path: string) =>
+  `${import.meta.env.BASE_URL}${path.replace(/^\//, "")}`;
+
+const mod = (value: number, divisor: number) =>
+  ((value % divisor) + divisor) % divisor;
+
+function autoCorrelate(buffer: Float32Array, sampleRate: number) {
+  let rms = 0;
+
+  for (let i = 0; i < buffer.length; i += 1) {
+    rms += buffer[i] * buffer[i];
+  }
+
+  rms = Math.sqrt(rms / buffer.length);
+
+  if (rms < 0.012) return null;
+
+  const minLag = Math.floor(sampleRate / 1100);
+  const maxLag = Math.min(
+    Math.floor(sampleRate / 55),
+    buffer.length - 1,
+  );
+
+  let bestLag = -1;
+  let bestCorrelation = 0;
+
+  const correlations = new Float32Array(maxLag + 1);
+
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let sum = 0;
+
+    for (let i = 0; i < buffer.length - lag; i += 1) {
+      sum += buffer[i] * buffer[i + lag];
+    }
+
+    const correlation = sum / (buffer.length - lag);
+    correlations[lag] = correlation;
+
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestLag = lag;
+    }
+  }
+
+  if (bestLag < 0 || bestCorrelation < 0.003) return null;
+
+  let chosenLag = bestLag;
+
+  for (let lag = minLag + 1; lag < bestLag; lag += 1) {
+    const isPeak =
+      correlations[lag] > correlations[lag - 1] &&
+      correlations[lag] >= correlations[lag + 1];
+
+    if (isPeak && correlations[lag] >= bestCorrelation * 0.9) {
+      chosenLag = lag;
+      break;
+    }
+  }
+
+  const left =
+    correlations[chosenLag - 1] ?? correlations[chosenLag];
+
+  const center = correlations[chosenLag];
+
+  const right =
+    correlations[chosenLag + 1] ?? correlations[chosenLag];
+
+  const denominator = left - 2 * center + right;
+
+  const shift = denominator
+    ? (0.5 * (left - right)) / denominator
+    : 0;
+
+  return sampleRate / (chosenLag + shift);
+}
+
+const centsBetween = (frequency: number, target: number) =>
+  1200 * Math.log2(frequency / target);
+
+function nearestPitchClassCents(
+  frequency: number,
+  pitchClass: number,
+) {
+  const midi = 69 + 12 * Math.log2(frequency / 440);
+  return (mod(midi - pitchClass + 6, 12) - 6) * 100;
+}
+
+function noteFromFrequency(frequency: number) {
+  const midi = Math.round(69 + 12 * Math.log2(frequency / 440));
+
+  return `${NOTE_LETTERS[mod(midi, 12)]}${
+    Math.floor(midi / 12) - 1
+  }`;
+}
+
+function MicIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="icon"
+    >
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6" />
+    </svg>
+  );
+}
+
+function GuitarIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="icon"
+    >
+      <path d="m15.5 4.5 4-2 2 2-2 4-3-1-4.7 4.7" />
+
+      <path d="M12.2 10.8c-2-2-4.3-2.4-5.5-.9-.7.9-.6 2.1-1.5 2.8-.8.7-2.3.4-3 1.4-1.1 1.5.2 4.3 2.8 6.2 2.7 1.9 5.7 2.1 6.8.5.7-1-.1-2.3.4-3.2.5-.9 1.8-1.1 2.4-2 1-1.5.2-3.4-2.4-4.8Z" />
+
+      <circle cx="8.5" cy="15.7" r="1.5" />
+    </svg>
+  );
+}
+
+function BeatIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="icon"
+    >
+      <path d="M8 20h8M10 20 8.5 5h7L14 20M9 9h6M12 5V2" />
+    </svg>
+  );
+}
+
+function VoiceIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="icon"
+    >
+      <path d="M4 12h2l2-6 3 12 2-9 2 6 2-3h3" />
+    </svg>
+  );
+}
+
+function InstrumentVisual({
+  instrument,
+  targets,
+  tuned,
+  activeId,
+}: {
+  instrument: Instrument;
+  targets: Target[];
+  tuned: Set<string>;
+  activeId: string | null;
+}) {
+  const image =
+    instrument === "guitar"
+      ? "instruments/classical-guitar.png"
+      : "instruments/baglama.png";
+
+  const alt =
+    instrument === "guitar"
+      ? "Sapı solda, gövdesi sağda gerçek klasik gitar"
+      : "Sapı solda, gövdesi sağda gerçek Türk bağlaması";
+
+  return (
+    <div
+      className={`instrument-photo ${instrument}`}
+      aria-label={
+        instrument === "guitar"
+          ? "Gerçekçi klasik gitar görseli"
+          : "Gerçekçi bağlama görseli"
+      }
+    >
+      <img src={assetPath(image)} alt={alt} />
+
+      <div className="photo-string-overlays" aria-hidden="true">
+        {targets.map((target, index) => (
+          <span
+            key={target.id}
+            className={[
+              "photo-string",
+              `s${index + 1}`,
+              tuned.has(target.id) ? "is-tuned" : "",
+              activeId === target.id ? "is-active" : "",
+            ].join(" ")}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Metronome() {
+  const [bpm, setBpm] = useState(92);
+  const [beats, setBeats] = useState(4);
+  const [running, setRunning] = useState(false);
+  const [currentBeat, setCurrentBeat] = useState(0);
+  const [volume, setVolume] = useState(0.7);
+
+  const tapsRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const tag = (event.target as HTMLElement)?.tagName;
+
+      if (
+        event.code === "Space" &&
+        !["INPUT", "BUTTON", "SELECT"].includes(tag)
+      ) {
+        event.preventDefault();
+        setRunning((value) => !value);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!running) return;
+
+    const context = new AudioContext();
+
+    let nextTime = context.currentTime + 0.08;
+    let beatIndex = 0;
+
+    const visualTimers: number[] = [];
+
+    const scheduleClick = (time: number, beat: number) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+
+      oscillator.frequency.value = beat === 0 ? 1200 : 760;
+
+      gain.gain.setValueAtTime(volume * 0.42, time);
+
+      gain.gain.exponentialRampToValueAtTime(
+        0.0001,
+        time + 0.045,
+      );
+
+      oscillator.connect(gain).connect(context.destination);
+
+      oscillator.start(time);
+      oscillator.stop(time + 0.05);
+
+      visualTimers.push(
+        window.setTimeout(
+          () => setCurrentBeat(beat),
+          Math.max(0, (time - context.currentTime) * 1000),
+        ),
+      );
+    };
+
+    const scheduler = () => {
+      while (nextTime < context.currentTime + 0.12) {
+        scheduleClick(nextTime, beatIndex);
+
+        nextTime += 60 / bpm;
+        beatIndex = (beatIndex + 1) % beats;
+      }
+    };
+
+    scheduler();
+
+    const timer = window.setInterval(scheduler, 25);
+
+    return () => {
+      window.clearInterval(timer);
+      visualTimers.forEach(window.clearTimeout);
+      context.close();
+    };
+  }, [running, bpm, beats, volume]);
+
+  const changeBpm = (next: number) => {
+    setBpm(Math.max(40, Math.min(240, Math.round(next))));
+  };
+
+  const tapTempo = () => {
+    const now = performance.now();
+
+    const recent = [
+      ...tapsRef.current.filter((tap) => now - tap < 2200),
+      now,
+    ].slice(-6);
+
+    tapsRef.current = recent;
+
+    if (recent.length > 1) {
+      const intervals = recent
+        .slice(1)
+        .map((tap, index) => tap - recent[index]);
+
+      const average =
+        intervals.reduce((sum, item) => sum + item, 0) /
+        intervals.length;
+
+      changeBpm(60000 / average);
+    }
+  };
+
+  return (
+    <section className="tool-view metronome-view">
+      <div className="tool-intro">
+        <p className="eyebrow">TEMPO ÇALIŞMASI</p>
+
+        <h1>
+          Ritmi hisset,
+          <br />
+          <em>tempoyu koru.</em>
+        </h1>
+
+        <p>
+          40–240 BPM aralığında, ölçünün ilk vuruşunu
+          vurgulayan hassas bir metronom.
+        </p>
+      </div>
+
+      <div className="metronome-console">
+        <div className="tempo-display">
+          <div
+            className={`pendulum ${running ? "running" : ""}`}
+            style={{
+              transform: `rotate(${
+                currentBeat % 2 ? 24 : -24
+              }deg)`,
+            }}
+          >
+            <span />
+          </div>
+
+          <div className="bpm-readout">
+            <button
+              onClick={() => changeBpm(bpm - 1)}
+              aria-label="Tempoyu bir azalt"
+            >
+              −
+            </button>
+
+            <div>
+              <strong>{bpm}</strong>
+              <span>BPM</span>
+            </div>
+
+            <button
+              onClick={() => changeBpm(bpm + 1)}
+              aria-label="Tempoyu bir artır"
+            >
+              +
+            </button>
+          </div>
+
+          <input
+            className="bpm-slider"
+            aria-label="Tempo"
+            type="range"
+            min="40"
+            max="240"
+            value={bpm}
+            onChange={(event) =>
+              changeBpm(Number(event.target.value))
+            }
+          />
+
+          <div className="tempo-presets">
+            {[
+              [60, "Largo"],
+              [80, "Andante"],
+              [100, "Moderato"],
+              [120, "Allegro"],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                onClick={() => changeBpm(Number(value))}
+              >
+                <span>{value}</span>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="metronome-controls">
+          <div
+            className="beat-lights"
+            aria-label={`${beats} vuruşlu ölçü`}
+          >
+            {Array.from({ length: beats }, (_, index) => (
+              <span
+                key={index}
+                className={
+                  running && currentBeat === index
+                    ? "active"
+                    : ""
+                }
+              >
+                {index + 1}
+              </span>
+            ))}
+          </div>
+
+          <div className="setting-block">
+            <span>ÖLÇÜ</span>
+
+            <div className="segmented">
+              {[2, 3, 4, 6].map((value) => (
+                <button
+                  key={value}
+                  className={beats === value ? "active" : ""}
+                  onClick={() => {
+                    setBeats(value);
+                    setCurrentBeat(0);
+                  }}
+                >
+                  {value}/{value === 6 ? 8 : 4}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="setting-block volume-control">
+            <span>SES SEVİYESİ</span>
+
+            <input
+              aria-label="Metronom ses seviyesi"
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={volume}
+              onChange={(event) =>
+                setVolume(Number(event.target.value))
+              }
+            />
+          </div>
+
+          <button
+            className={`metronome-start ${
+              running ? "stop" : ""
+            }`}
+            onClick={() => setRunning((value) => !value)}
+          >
+            <span>{running ? "■" : "▶"}</span>
+            {running ? "Durdur" : "Başlat"}
+          </button>
+
+          <button className="tap-button" onClick={tapTempo}>
+            TAP <small>Ritme göre dokun</small>
+          </button>
+
+          <p>
+            Klavye kısayolu: <kbd>Boşluk</kbd> ile
+            başlat/durdur
+          </p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+type VoiceFrame = {
+  midi: number;
+  time: number;
+  energy: number;
+};
+
+type VoiceResult = {
+  keyName: string;
+  keySymbol: string;
+  chordName: string;
+  chordSymbol: string;
+  confidence: number;
+  low: string;
+  high: string;
+  sampleSeconds: number;
+};
+
+const MAJOR_PROFILE = [
+  6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+  2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+];
+
+const MINOR_PROFILE = [
+  6.33, 2.68, 3.52, 5.38, 2.6, 3.53,
+  2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+];
+
+function analyzeVoice(
+  frames: VoiceFrame[],
+): VoiceResult | null {
+  if (frames.length < 35) return null;
+
+  const histogram = Array(12).fill(0) as number[];
+
+  frames.forEach((frame) => {
+    histogram[mod(Math.round(frame.midi), 12)] +=
+      0.35 + Math.min(1, frame.energy * 12);
+  });
+
+  const total =
+    histogram.reduce((sum, value) => sum + value, 0) || 1;
+
+  const normalized = histogram.map(
+    (value) => value / total,
+  );
+
+  const ending = Array(12).fill(0) as number[];
+
+  frames
+    .slice(-Math.min(35, frames.length))
+    .forEach((frame) => {
+      ending[mod(Math.round(frame.midi), 12)] += 1;
+    });
+
+  const endingPc = ending.indexOf(Math.max(...ending));
+
+  const scores: {
+    tonic: number;
+    mode: "major" | "minor";
+    score: number;
+  }[] = [];
+
+  for (let tonic = 0; tonic < 12; tonic += 1) {
+    (["major", "minor"] as const).forEach((mode) => {
+      const profile =
+        mode === "major" ? MAJOR_PROFILE : MINOR_PROFILE;
+
+      const profileTotal = profile.reduce(
+        (sum, value) => sum + value,
+        0,
+      );
+
+      let score = 0;
+
+      for (let pc = 0; pc < 12; pc += 1) {
+        score +=
+          normalized[pc] *
+          (profile[mod(pc - tonic, 12)] / profileTotal);
+      }
+
+      if (tonic === endingPc) score += 0.012;
+
+      scores.push({ tonic, mode, score });
+    });
+  }
+
+  scores.sort((a, b) => b.score - a.score);
+
+  const best = scores[0];
+
+  const confidence = Math.max(
+    42,
+    Math.min(
+      94,
+      Math.round(
+        58 + (best.score - scores[1].score) * 1500,
+      ),
+    ),
+  );
+
+  const firstLimit = Math.min(
+    3,
+    frames[frames.length - 1].time,
+  );
+
+  const firstHistogram = Array(12).fill(0) as number[];
+
+  frames
+    .filter((frame) => frame.time <= firstLimit)
+    .forEach((frame) => {
+      firstHistogram[mod(Math.round(frame.midi), 12)] += 1;
+    });
+
+  const chordDefs =
+    best.mode === "major"
+      ? ([
+          [0, "major"],
+          [2, "minor"],
+          [4, "minor"],
+          [5, "major"],
+          [7, "major"],
+          [9, "minor"],
+          [11, "dim"],
+        ] as const)
+      : ([
+          [0, "minor"],
+          [2, "dim"],
+          [3, "major"],
+          [5, "minor"],
+          [7, "minor"],
+          [8, "major"],
+          [10, "major"],
+        ] as const);
+
+  const chordScores = chordDefs
+    .map(([offset, quality]) => {
+      const root = mod(best.tonic + offset, 12);
+
+      const third = mod(
+        root + (quality === "major" ? 4 : 3),
+        12,
+      );
+
+      const fifth = mod(
+        root + (quality === "dim" ? 6 : 7),
+        12,
+      );
+
+      return {
+        root,
+        quality,
+        score:
+          firstHistogram[root] * 1.7 +
+          firstHistogram[third] +
+          firstHistogram[fifth] * 0.8,
+      };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const chord = chordScores[0];
+
+  const suffix =
+    chord.quality === "minor"
+      ? "m"
+      : chord.quality === "dim"
+        ? "dim"
+        : "";
+
+  const qualityTr =
+    chord.quality === "minor"
+      ? "minör"
+      : chord.quality === "dim"
+        ? "eksik"
+        : "majör";
+
+  const sortedMidi = frames
+    .map((frame) => frame.midi)
+    .sort((a, b) => a - b);
+
+  const lowMidi = Math.round(
+    sortedMidi[Math.floor(sortedMidi.length * 0.04)],
+  );
+
+  const highMidi = Math.round(
+    sortedMidi[Math.floor(sortedMidi.length * 0.96)],
+  );
+
+  const midiLabel = (midi: number) =>
+    `${NOTE_LETTERS[mod(midi, 12)]}${
+      Math.floor(midi / 12) - 1
+    }`;
+
+  return {
+    keyName: `${NOTE_NAMES[best.tonic]} ${
+      best.mode === "major" ? "majör" : "minör"
+    }`,
+
+    keySymbol: `${NOTE_LETTERS[best.tonic]}${
+      best.mode === "minor" ? "m" : ""
+    }`,
+
+    chordName: `${NOTE_NAMES[chord.root]} ${qualityTr}`,
+    chordSymbol: `${NOTE_LETTERS[chord.root]}${suffix}`,
+    confidence,
+    low: midiLabel(lowMidi),
+    high: midiLabel(highMidi),
+
+    sampleSeconds: Math.round(
+      frames[frames.length - 1].time,
+    ),
+  };
+}
+
+function VoiceAnalyzer() {
+  const [recording, setRecording] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [liveNote, setLiveNote] = useState("—");
+  const [energy, setEnergy] = useState(0);
+  const [result, setResult] = useState<VoiceResult | null>(null);
+  const [error, setError] = useState("");
+
+  const contextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const framesRef = useRef<VoiceFrame[]>([]);
+
+  const release = () => {
+    if (frameRef.current) {
+      cancelAnimationFrame(frameRef.current);
+    }
+
+    if (timerRef.current) {
+      window.clearInterval(timerRef.current);
+    }
+
+    streamRef.current
+      ?.getTracks()
+      .forEach((track) => track.stop());
+
+    contextRef.current?.close();
+
+    frameRef.current = null;
+    timerRef.current = null;
+    streamRef.current = null;
+    contextRef.current = null;
+  };
+
+  useEffect(() => {
+    return () => release();
+  }, []);
+
+  const start = async () => {
+    setError("");
+    setResult(null);
+    setDuration(0);
+    setLiveNote("—");
+    framesRef.current = [];
+
+    try {
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+
+      const context = new AudioContext();
+      const analyser = context.createAnalyser();
+
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.1;
+
+      context
+        .createMediaStreamSource(stream)
+        .connect(analyser);
+
+      streamRef.current = stream;
+      contextRef.current = context;
+
+      setRecording(true);
+
+      const buffer = new Float32Array(analyser.fftSize);
+      const started = context.currentTime;
+
+      let frameCount = 0;
+
+      timerRef.current = window.setInterval(() => {
+        setDuration(
+          Math.floor(context.currentTime - started),
+        );
+      }, 250);
+
+      const tick = () => {
+        analyser.getFloatTimeDomainData(buffer);
+        frameCount += 1;
+
+        if (frameCount % 3 === 0) {
+          let rms = 0;
+
+          for (let i = 0; i < buffer.length; i += 1) {
+            rms += buffer[i] * buffer[i];
+          }
+
+          rms = Math.sqrt(rms / buffer.length);
+
+          setEnergy(Math.min(1, rms * 12));
+
+          const frequency = autoCorrelate(
+            buffer,
+            context.sampleRate,
+          );
+
+          if (
+            frequency &&
+            frequency >= 65 &&
+            frequency <= 1050
+          ) {
+            const midi =
+              69 + 12 * Math.log2(frequency / 440);
+
+            framesRef.current.push({
+              midi,
+              time: context.currentTime - started,
+              energy: rms,
+            });
+
+            setLiveNote(noteFromFrequency(frequency));
+          }
+        }
+
+        frameRef.current = requestAnimationFrame(tick);
+      };
+
+      tick();
+    } catch {
+      setError(
+        "Mikrofona erişilemedi. Tarayıcı ayarlarından mikrofon iznini açın.",
+      );
+    }
+  };
+
+  const finish = () => {
+    release();
+    setRecording(false);
+    setEnergy(0);
+
+    const analysis = analyzeVoice(framesRef.current);
+
+    if (!analysis) {
+      setError(
+        "Yeterli temiz ses algılanamadı. Sessiz bir ortamda en az 5–10 saniye söyleyip yeniden deneyin.",
+      );
+
+      return;
+    }
+
+    setResult(analysis);
+  };
+
+  return (
+    <section className="tool-view voice-view">
+      <div className="tool-intro">
+        <p className="eyebrow">SES ANALİZİ</p>
+
+        <h1>
+          Şarkını söyle,
+          <br />
+          <em>tonunu keşfet.</em>
+        </h1>
+
+        <p>
+          Melodinizdeki notaları cihaz üzerinde analiz eder;
+          tonaliteyi ve olası başlangıç akorunu tahmin eder.
+        </p>
+      </div>
+
+      <div className="voice-console">
+        <div
+          className={`listening-orb ${
+            recording ? "active" : ""
+          }`}
+        >
+          <div className="orb-rings">
+            <span />
+            <span />
+            <span />
+          </div>
+
+          <MicIcon />
+
+          <strong>
+            {recording
+              ? liveNote
+              : result
+                ? result.keySymbol
+                : "HAZIR"}
+          </strong>
+
+          <small>
+            {recording
+              ? `${String(Math.floor(duration / 60)).padStart(
+                  2,
+                  "0",
+                )}:${String(duration % 60).padStart(
+                  2,
+                  "0",
+                )} · Dinliyorum`
+              : result
+                ? "Analiz tamamlandı"
+                : "Başlamak için dokunun"}
+          </small>
+        </div>
+
+        <div className="voice-wave" aria-hidden="true">
+          {Array.from({ length: 18 }, (_, index) => (
+            <span
+              key={index}
+              style={{
+                height: `${
+                  8 +
+                  Math.max(0.05, energy) *
+                    (18 + ((index * 17) % 43))
+                }px`,
+              }}
+            />
+          ))}
+        </div>
+
+        {!recording && !result && (
+          <button className="listen-start" onClick={start}>
+            <MicIcon />
+            Dinlemeyi başlat
+          </button>
+        )}
+
+        {recording && (
+          <button
+            className="listen-start finish"
+            onClick={finish}
+          >
+            <span className="stop-square" />
+            Bitir ve analiz et
+          </button>
+        )}
+
+        {error && <p className="voice-error">{error}</p>}
+
+        {result && (
+          <div className="analysis-result">
+            <div className="result-heading">
+              <span>ANALİZ SONUCU</span>
+
+              <button onClick={start}>Yeniden dinle</button>
+            </div>
+
+            <div className="result-cards">
+              <article>
+                <small>TAHMİNİ TONALİTE</small>
+                <strong>{result.keyName}</strong>
+                <b>{result.keySymbol}</b>
+                <span>Güven: %{result.confidence}</span>
+              </article>
+
+              <article>
+                <small>OLASI BAŞLANGIÇ AKORU</small>
+                <strong>{result.chordName}</strong>
+                <b>{result.chordSymbol}</b>
+                <span>İlk melodik cümleye göre</span>
+              </article>
+            </div>
+
+            <div className="range-row">
+              <span>SES ARALIĞI</span>
+              <strong>
+                {result.low} — {result.high}
+              </strong>
+              <small>
+                {result.sampleSeconds} sn temiz örnek analiz
+                edildi
+              </small>
+            </div>
+
+            <p>
+              <strong>Önemli:</strong> Tek sesli vokal, akorları
+              doğrudan içermez. Bu nedenle başlangıç akoru;
+              algılanan tonalite ve ilk notalardan hesaplanan
+              müzikal bir tahmindir. En doğru sonuç için şarkıya
+              karar notasından başlayın ve nakarat dâhil en az
+              20 saniye söyleyin.
+            </p>
+          </div>
+        )}
+
+        <p className="local-processing">
+          Ses kaydedilmez veya yüklenmez; analiz yalnızca bu
+          cihazda yapılır.
+        </p>
+      </div>
+    </section>
+  );
+}
+
+export default function App() {
+  const [section, setSection] =
+    useState<Section>("tuner");
+
+  const [instrument, setInstrument] =
+    useState<Instrument>("guitar");
+
+  const [baglamaKind, setBaglamaKind] =
+    useState<BaglamaKind>("short");
+
+  const [decision, setDecision] = useState(9);
+  const [listening, setListening] = useState(false);
+
+  const [detectedHz, setDetectedHz] =
+    useState<number | null>(null);
+
+  const [activeTarget, setActiveTarget] =
+    useState<Target | null>(null);
+
+  const [cents, setCents] = useState(0);
+
+  const [tuned, setTuned] = useState<Set<string>>(
+    new Set(),
+  );
+
+  const [message, setMessage] = useState(
+    "Mikrofonu açın ve tek bir tele vurun",
+  );
+
+  const [error, setError] = useState("");
+
+  const audioContextRef =
+    useRef<AudioContext | null>(null);
+
+  const streamRef = useRef<MediaStream | null>(null);
+  const frameRef = useRef<number | null>(null);
+
+  const stableRef = useRef({
+    id: "",
+    frames: 0,
+  });
+
+  const baglamaTargets: Target[] = (() => {
+    const offsets =
+      baglamaKind === "short"
+        ? [-7, -2, 0]
+        : [0, 5, -2];
+
+    return [
+      "Alt tel grubu",
+      "Orta tel grubu",
+      "Üst tel grubu",
+    ].map((label, index) => {
+      const pc = mod(
+        decision + offsets[index],
+        12,
+      );
+
+      return {
+        id: `b${index}`,
+        label,
+        note: `${NOTE_NAMES[pc]} · ${NOTE_LETTERS[pc]}`,
+        pitchClass: pc,
+      };
+    });
+  })();
+
+  const targets =
+    instrument === "guitar"
+      ? GUITAR_TARGETS
+      : baglamaTargets;
+
+  const stopTuner = useCallback(() => {
+    if (frameRef.current) {
+      cancelAnimationFrame(frameRef.current);
+    }
+
+    streamRef.current
+      ?.getTracks()
+      .forEach((track) => track.stop());
+
+    audioContextRef.current?.close();
+
+    frameRef.current = null;
+    streamRef.current = null;
+    audioContextRef.current = null;
+
+    setListening(false);
+  }, []);
+
+  const processPitch = useCallback(
+    (frequency: number) => {
+      let target: Target;
+      let offset: number;
+
+      if (instrument === "guitar") {
+        const ranked = GUITAR_TARGETS.map((item) => ({
+          item,
+          cents: centsBetween(
+            frequency,
+            item.frequency!,
+          ),
+        }))
+          .filter((item) => Math.abs(item.cents) < 650)
+          .sort(
+            (a, b) =>
+              Math.abs(a.cents) - Math.abs(b.cents),
+          );
+
+        if (!ranked.length) {
+          setActiveTarget(null);
+
+          setMessage(
+            "Standart gitar aralığında net bir tel sesi bekleniyor",
+          );
+
+          return;
+        }
+
+        target = ranked[0].item;
+        offset = ranked[0].cents;
+      } else {
+        const ranked = baglamaTargets
+          .map((item) => ({
+            item,
+            cents: nearestPitchClassCents(
+              frequency,
+              item.pitchClass!,
+            ),
+          }))
+          .sort(
+            (a, b) =>
+              Math.abs(a.cents) - Math.abs(b.cents),
+          );
+
+        target = ranked[0].item;
+        offset = ranked[0].cents;
+      }
+
+      setDetectedHz(frequency);
+      setActiveTarget(target);
+
+      setCents(
+        Math.max(-50, Math.min(50, offset)),
+      );
+
+      if (Math.abs(offset) <= 7) {
+        stableRef.current =
+          stableRef.current.id === target.id
+            ? {
+                id: target.id,
+                frames: stableRef.current.frames + 1,
+              }
+            : {
+                id: target.id,
+                frames: 1,
+              };
+
+        setMessage("Tam ayar — tel doğru tonda");
+
+        if (stableRef.current.frames >= 8) {
+          setTuned((previous) => {
+            const next = new Set(previous);
+            next.add(target.id);
+            return next;
+          });
+        }
+      } else {
+        stableRef.current = {
+          id: target.id,
+          frames: 0,
+        };
+
+        setMessage(
+          offset < 0
+            ? "Ses pes — burguyu biraz sıkın"
+            : "Ses tiz — burguyu biraz gevşetin",
+        );
+      }
+    },
+    [instrument, baglamaTargets],
+  );
+
+  const startTuner = useCallback(async () => {
+    setError("");
+
+    try {
+      const stream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+
+      const context = new AudioContext();
+      const analyser = context.createAnalyser();
+
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.12;
+
+      context
+        .createMediaStreamSource(stream)
+        .connect(analyser);
+
+      streamRef.current = stream;
+      audioContextRef.current = context;
+
+      setListening(true);
+
+      setMessage(
+        "Dinliyorum — bir tele tek ve net vurun",
+      );
+
+      const buffer = new Float32Array(
+        analyser.fftSize,
+      );
+
+      const tick = () => {
+        analyser.getFloatTimeDomainData(buffer);
+
+        const frequency = autoCorrelate(
+          buffer,
+          context.sampleRate,
+        );
+
+        if (frequency) {
+          processPitch(frequency);
+        }
+
+        frameRef.current =
+          requestAnimationFrame(tick);
+      };
+
+      tick();
+    } catch {
+      setError(
+        "Mikrofona erişilemedi. Tarayıcı ayarlarından mikrofon iznini açın.",
+      );
+    }
+  }, [processPitch]);
+
+  useEffect(() => {
+    return stopTuner;
+  }, [stopTuner]);
+
+  const resetTunerState = () => {
+    stopTuner();
+    setTuned(new Set());
+    setActiveTarget(null);
+    setDetectedHz(null);
+    setCents(0);
+
+    stableRef.current = {
+      id: "",
+      frames: 0,
+    };
+  };
+
+  const switchSection = (next: Section) => {
+    if (section === "tuner" && next !== "tuner") {
+      stopTuner();
+    }
+
+    setSection(next);
+  };
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <button
+          className="brand"
+          onClick={() => switchSection("tuner")}
+          aria-label="Tel ve Ton ana sayfa"
+        >
+          <img
+            className="brand-mark"
+            src={assetPath("icons/icon-192.png")}
+            alt=""
+          />
+
+          <span>
+            <strong>TEL &amp; TON</strong>
+            <small>MÜZİK STÜDYOSU</small>
+          </span>
+        </button>
+
+        <nav
+          className="main-nav"
+          aria-label="Uygulama bölümleri"
+        >
+          <button
+            className={
+              section === "tuner" ? "active" : ""
+            }
+            onClick={() => switchSection("tuner")}
+          >
+            <GuitarIcon />
+            Akort
+          </button>
+
+          <button
+            className={
+              section === "metronome" ? "active" : ""
+            }
+            onClick={() => switchSection("metronome")}
+          >
+            <BeatIcon />
+            Metronom
+          </button>
+
+          <button
+            className={
+              section === "voice" ? "active" : ""
+            }
+            onClick={() => switchSection("voice")}
+          >
+            <VoiceIcon />
+            Tonumu Bul
+          </button>
+        </nav>
+
+        <div
+          className={`status-dot ${
+            listening ? "on" : ""
+          }`}
+        >
+          <span />
+          {listening ? "Mikrofon açık" : "Hazır"}
+        </div>
+      </header>
+
+      {section === "tuner" && (
+        <section className="studio-view">
+          <div className="section-heading">
+            <p className="eyebrow">HASSAS AKORT</p>
+
+            <h1>
+              Enstrümanını seç,
+              <br />
+              <em>sesini kusursuzlaştır.</em>
+            </h1>
+
+            <p>
+              Tarayıcınızın mikrofonu teli otomatik tanır;
+              doğru burguyu sıkmanız veya gevşetmeniz için
+              anlık yönlendirme verir.
+            </p>
+          </div>
+
+          <div
+            className="instrument-switch"
+            role="group"
+            aria-label="Enstrüman seçimi"
+          >
+            <button
+              className={
+                instrument === "guitar" ? "active" : ""
+              }
+              onClick={() => {
+                resetTunerState();
+                setInstrument("guitar");
+              }}
+            >
+              <GuitarIcon />
+
+              <span>
+                <strong>Gitar</strong>
+                <small>
+                  Standart E · A · D · G · B · E
+                </small>
+              </span>
+            </button>
+
+            <button
+              className={
+                instrument === "baglama" ? "active" : ""
+              }
+              onClick={() => {
+                resetTunerState();
+                setInstrument("baglama");
+              }}
+            >
+              <span className="baglama-mini">ϟ</span>
+
+              <span>
+                <strong>Bağlama</strong>
+                <small>Karar sesine göre akort</small>
+              </span>
+            </button>
+          </div>
+
+          {instrument === "baglama" && (
+            <div className="baglama-settings">
+              <label>
+                Bağlama türü
+
+                <select
+                  value={baglamaKind}
+                  onChange={(event) => {
+                    resetTunerState();
+
+                    setBaglamaKind(
+                      event.target.value as BaglamaKind,
+                    );
+                  }}
+                >
+                  <option value="short">
+                    Kısa sap · Bağlama düzeni
+                  </option>
+
+                  <option value="long">
+                    Uzun sap · Bozuk/Kara düzen
+                  </option>
+                </select>
+              </label>
+
+              <label>
+                Karar sesi
+
+                <select
+                  value={decision}
+                  onChange={(event) => {
+                    resetTunerState();
+                    setDecision(Number(event.target.value));
+                  }}
+                >
+                  {DECISION_NOTES.map((pc) => (
+                    <option key={pc} value={pc}>
+                      {NOTE_NAMES[pc]} · {NOTE_LETTERS[pc]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <p>
+                {baglamaKind === "short"
+                  ? "Bağlama düzeni: karar sesine göre Re–Sol–La aralık ilişkisi"
+                  : "Bozuk/Kara düzen: karar sesine göre La–Re–Sol aralık ilişkisi"}
+              </p>
+            </div>
+          )}
+
+          <div className="tuner-workbench">
+            <div className="instrument-stage">
+              <div className="stage-label">
+                <span>
+                  {instrument === "guitar"
+                    ? "AKUSTİK GİTAR"
+                    : baglamaKind === "short"
+                      ? "KISA SAP BAĞLAMA"
+                      : "UZUN SAP BAĞLAMA"}
+                </span>
+
+                <small>
+                  {tuned.size}/{targets.length} hazır
+                </small>
+              </div>
+
+              <InstrumentVisual
+                instrument={instrument}
+                targets={targets}
+                tuned={tuned}
+                activeId={activeTarget?.id ?? null}
+              />
+
+              <div
+                className={`detector-card ${
+                  Math.abs(cents) <= 7 && activeTarget
+                    ? "in-tune"
+                    : ""
+                }`}
+              >
+                <div className="detected-note">
+                  <span>
+                    {activeTarget
+                      ? activeTarget.note.split(" · ")[1]
+                      : "—"}
+                  </span>
+
+                  <small>
+                    {detectedHz
+                      ? `${detectedHz.toFixed(
+                          1,
+                        )} Hz · ${noteFromFrequency(
+                          detectedHz,
+                        )}`
+                      : "Tel bekleniyor"}
+                  </small>
+                </div>
+
+                <div className="tuner-meter">
+                  <div className="meter-scale">
+                    <i>-50</i>
+                    <i>-25</i>
+                    <i>0</i>
+                    <i>+25</i>
+                    <i>+50</i>
+                  </div>
+
+                  <div className="meter-track">
+                    <span className="sweet-spot" />
+
+                    <span
+                      className="needle"
+                      style={{
+                        left: `${50 + cents}%`,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="tune-guidance">
+                  <strong>
+                    {activeTarget?.label ?? "Hazır"}
+                  </strong>
+
+                  <span>{message}</span>
+                </div>
+              </div>
+            </div>
+
+            <aside className="string-panel">
+              <div className="panel-title">
+                <span>TEL DURUMU</span>
+
+                <small>
+                  {tuned.size === targets.length
+                    ? "Akort tamamlandı"
+                    : "Sırayla kontrol edin"}
+                </small>
+              </div>
+
+              <div className="string-list">
+                {targets.map((target, index) => (
+                  <div
+                    key={target.id}
+                    className={[
+                      "string-row",
+                      tuned.has(target.id) ? "done" : "",
+                      activeTarget?.id === target.id
+                        ? "current"
+                        : "",
+                    ].join(" ")}
+                  >
+                    <span className="string-number">
+                      {instrument === "guitar"
+                        ? 6 - index
+                        : index + 1}
+                    </span>
+
+                    <span>
+                      <strong>{target.note}</strong>
+                      <small>{target.label}</small>
+                    </span>
+
+                    <i>
+                      {tuned.has(target.id)
+                        ? "✓"
+                        : activeTarget?.id === target.id
+                          ? `${Math.round(cents)}¢`
+                          : "○"}
+                    </i>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                className={`primary-action ${
+                  listening ? "stop" : ""
+                }`}
+                onClick={
+                  listening ? stopTuner : startTuner
+                }
+              >
+                {listening ? (
+                  <span className="stop-square" />
+                ) : (
+                  <MicIcon />
+                )}
+
+                {listening
+                  ? "Dinlemeyi durdur"
+                  : "Mikrofonu aç"}
+              </button>
+
+              <button
+                className="reset-button"
+                onClick={() => setTuned(new Set())}
+              >
+                Tamamlananları sıfırla
+              </button>
+
+              {error && (
+                <p className="error-message">{error}</p>
+              )}
+
+              <p className="privacy-note">
+                Ses cihazınızda anlık işlenir; kayıt edilmez.
+              </p>
+            </aside>
+          </div>
+        </section>
+      )}
+
+      {section === "metronome" && <Metronome />}
+
+      {section === "voice" && <VoiceAnalyzer />}
+
+      <footer>
+        <span>Tel &amp; Ton</span>
+        <p>Kulaktan değil, ölçerek.</p>
+        <small>A4 = 440 Hz</small>
+      </footer>
+    </main>
+  );
+}
